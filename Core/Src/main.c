@@ -10,7 +10,6 @@
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_accelero.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_tsensor.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_gyro.h"
-#include "sound_sensor.h"   /* Grove Sound Sensor on A0 (PC5) */
 
 #include "stdio.h"
 #include "string.h"
@@ -45,13 +44,6 @@ int main(void)
 	/*Set the initial LED state to off*/
 	BSP_LED_Off(LED2);
 
-	/* ---------- Grove Sound Sensor initialisation ----------
-	 * ADC1 on PC5, TIM3 for recording trigger, DMA for audio capture.
-	 * Pass &huart1 so debug messages and audio streams go out UART1.
-	 * Pass NULL instead to disable all UART output from the sensor.
-	 */
-	Sound_Init(&huart1);
-
 	int accel_buff_x[4]={0};
 	int accel_buff_y[4]={0};
 	int accel_buff_z[4]={0};
@@ -66,9 +58,6 @@ int main(void)
 	int fall_state     = 0;   // current phase
 	int state_timer    = 0;   // iterations left in the current window
 	int fall_cooldown  = 0;   // iterations of fast-blink remaining
-
-	/* ---- Sound-sensor event struct (updated each loop) ---- */
-	Sound_ThreshEvent_t sound_evt = {0};
 
 	// LED pacing (decoupled from loop delay so blink rate is independent)
 	int led_counter    = 0;
@@ -127,7 +116,7 @@ int main(void)
 		accel_filt_c[2]=(float)mov_avg_C(N,accel_buff_z) * (9.8/1000.0f);
 
 		/***************************UART transmission*******************************************/
-		char buffer[200]; // Buffer for UART messages (enlarged for sound-sensor alerts)
+		char buffer[150]; // Create a buffer large enough to hold the text
 
 		/******Transmitting results of C execution over UART*********/
 		if(i>=3)
@@ -167,24 +156,7 @@ int main(void)
 			HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 		}
 
-		/* ---------- Grove Sound Sensor: threshold check ----------
-		 * Polls the ADC, checks for loud sounds (thump / scream).
-		 * Result is stored in sound_evt; sound_evt.detected == 1
-		 * means a loud event was just confirmed.
-		 *
-		 * To DISABLE this check (e.g. for debugging), set
-		 * SOUND_ENABLE_THRESHOLD to 0 in sound_sensor.h.
-		 */
-		Sound_ThresholdCheck(&sound_evt);
-
-		/* ---------- Sound sensor: recording tick ----------
-		 * If a recording is in progress, this streams completed
-		 * DMA buffers over UART (or keeps them in RAM for debug).
-		 * Does nothing when not recording.
-		 */
-		Sound_RecordingTick();
-
-		HAL_Delay(delay_ms);	// 200 ms delay
+		HAL_Delay(delay_ms);	// 1 second delay
 
 		i++;
 
@@ -237,7 +209,7 @@ int main(void)
 
 			switch(fall_state)
 			{
-				/* ---- Phase 0: IDLE — watch for anomaly ---- */
+			/* ---- Phase 0: IDLE — watch for anomaly ---- */
 			case 0:
 				// a) Free-fall detected in raw OR filtered
 				if(raw_mag_sq < FF_RAW_SQ || accel_mag_sq < FF_FILT_SQ)
@@ -251,25 +223,6 @@ int main(void)
 					fall_state   = 2;
 					fall_cooldown = 25; // 25 × 200 ms = 5 s fast-blink
 					sprintf(buffer, "*** FALL DETECTED (direct impact) ***\r\n");
-					HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
-
-					/* Start recording audio immediately after impact detection.
-					 * The recording runs for SOUND_MAX_RECORD_SECS seconds
-					 * (set in sound_sensor.h, default 120 s ≈ 2 minutes).
-					 * To DISABLE auto-recording on fall, comment out the line below. */
-					Sound_StartRecording();
-				}
-				// c) Loud sound alone (thump / scream) — complementary cue
-				else if(sound_evt.detected)
-				{
-					/* A loud sound by itself doesn't confirm a fall, but
-					 * it can enter the free-fall-watch window as a precaution.
-					 * If accelerometer also shows anomaly within 3 s, fall is
-					 * confirmed.  Adjust this policy as needed. */
-					fall_state  = 1;
-					state_timer = 15;  // 3 s window
-					sprintf(buffer, "*** LOUD SOUND (peak ADC=%u) — watching for fall ***\r\n",
-					        sound_evt.peak_adc);
 					HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 				}
 				break;
@@ -285,11 +238,6 @@ int main(void)
 					state_timer   = 0;
 					sprintf(buffer, "*** FALL DETECTED (freefall+impact) ***\r\n");
 					HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
-
-					/* Start recording audio — captures surroundings after
-					 * confirmed fall (e.g. "help" calls, environment sounds).
-					 * To DISABLE, comment out or set SOUND_ENABLE_RECORDING=0. */
-					Sound_StartRecording();
 				}
 				else if(--state_timer <= 0)
 				{
@@ -303,11 +251,6 @@ int main(void)
 				{
 					fall_state   = 0;
 					fall_cooldown = 0;
-
-					/* Stop recording when the fall-alert cooldown expires,
-					 * unless recording already finished on its own (max duration). */
-					if (Sound_GetRecState() == SOUND_REC_RUNNING)
-						Sound_StopRecording();
 				}
 				break;
 			}
