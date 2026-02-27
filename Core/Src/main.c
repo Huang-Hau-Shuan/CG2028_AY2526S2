@@ -16,6 +16,8 @@
 #include <sys/stat.h>
 
 static void UART1_Init(void);
+static void Buzzer_Init(void);      // PB0 → Arduino D3, active-HIGH
+static void UserButton_Init(void);  // PC13 → Blue User Button B2 (ext. pull-down, pressed=HIGH)
 
 extern void initialise_monitor_handles(void);	// for semi-hosting support (printf). Will not be required if transmitting via UART
 
@@ -44,6 +46,12 @@ int main(void)
 	/*Set the initial LED state to off*/
 	BSP_LED_Off(LED2);
 
+	/* Buzzer (PB0 / Arduino D3) initialisation */
+	Buzzer_Init();
+
+	/* Blue User Button B2 on PC13 (external pull-down, pressed = HIGH) */
+	UserButton_Init();
+
 	int accel_buff_x[4]={0};
 	int accel_buff_y[4]={0};
 	int accel_buff_z[4]={0};
@@ -52,17 +60,22 @@ int main(void)
 
 	/*--- Fall-detection state machine (Apple-Watch-inspired) ---
 	 * Phase 0  IDLE:            monitor for free-fall or big spike
+	 *                           Button press → manual alarm override
 	 * Phase 1  FREEFALL_PHASE:  free-fall seen → wait for impact + rotation
-	 * Phase 2  FALL_CONFIRMED:  fast-blink, print alert, cool down
+	 *                           Button press → force alarm
+	 * Phase 2  FALL_CONFIRMED:  buzzer ON + fast-blink
+	 *                           Button press → clear/reset alarm
 	 *-----------------------------------------------------------*/
 	int fall_state     = 0;   // current phase
 	int state_timer    = 0;   // iterations left in the current window
-	int fall_cooldown  = 0;   // iterations of fast-blink remaining
 
 	// LED pacing (decoupled from loop delay so blink rate is independent)
 	int led_counter    = 0;
 	const int LED_SLOW = 5;   // toggle every 5×200 ms = 1 s  (≈ 0.5 Hz blink)
 	const int LED_FAST = 1;   // toggle every 1×200 ms = 200 ms during fall cooldown
+
+	// Button edge detection (rising-edge only, so holding doesn't re-trigger)
+	int btn_prev = 0;
 
 	while (1)
 	{
@@ -156,9 +169,19 @@ int main(void)
 			HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 		}
 
-		HAL_Delay(delay_ms);	// 1 second delay
+		HAL_Delay(delay_ms);	// 200 ms delay
 
 		i++;
+
+		/* ---- Blue Button (B2, PC13) poll with edge detection ---- */
+		int btn_now = (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_SET); // pressed = HIGH
+		int btn_pressed = (btn_now && !btn_prev);  // rising-edge only
+		btn_prev = btn_now;
+
+		/* Debug: print button state every loop */
+		sprintf(buffer, "[BTN] state=%d  pressed=%d  fall_state=%d\r\n",
+				btn_now, btn_pressed, fall_state);
+		HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 
 		// ********* Fall detection (Apple-Watch-inspired state machine) *********/
 		if(i >= 3)
@@ -209,19 +232,27 @@ int main(void)
 
 			switch(fall_state)
 			{
-			/* ---- Phase 0: IDLE — watch for anomaly ---- */
+			/* ---- Phase 0: IDLE — watch for anomaly, or manual override ---- */
 			case 0:
-				// a) Free-fall detected in raw OR filtered
-				if(raw_mag_sq < FF_RAW_SQ || accel_mag_sq < FF_FILT_SQ)
+				// a) Manual override: user pressed Blue Button (B2)
+				if(btn_pressed)
+				{
+					fall_state = 2;
+					HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET); // BUZZER ON
+					sprintf(buffer, "*** FALL ALARM (manual override - B2) ***\r\n");
+					HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+				}
+				// b) Free-fall detected in raw OR filtered
+				else if(raw_mag_sq < FF_RAW_SQ || accel_mag_sq < FF_FILT_SQ)
 				{
 					fall_state  = 1;
-					state_timer = 15; // 15 × 200 ms = 3 s window for impact
+					state_timer = 15; // 15 x 200 ms = 3 s window for impact
 				}
-				// b) Extremely hard impact without observable free-fall
+				// c) Extremely hard impact without observable free-fall
 				else if(raw_mag_sq > DIRECT_HIT_SQ && gyro_mag_sq > GYRO_SQ)
 				{
-					fall_state   = 2;
-					fall_cooldown = 25; // 25 × 200 ms = 5 s fast-blink
+					fall_state = 2;
+					HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET); // BUZZER ON
 					sprintf(buffer, "*** FALL DETECTED (direct impact) ***\r\n");
 					HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 				}
@@ -229,13 +260,22 @@ int main(void)
 
 			/* ---- Phase 1: FREE-FALL seen — look for impact + rotation ---- */
 			case 1:
-				if((raw_mag_sq > IMPACT_RAW_SQ || accel_mag_sq > IMPACT_FILT_SQ)
+				// Button press during free-fall window → force alarm
+				if(btn_pressed)
+				{
+					fall_state  = 2;
+					state_timer = 0;
+					HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET); // BUZZER ON
+					sprintf(buffer, "*** FALL ALARM (manual override - B2) ***\r\n");
+					HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+				}
+				else if((raw_mag_sq > IMPACT_RAW_SQ || accel_mag_sq > IMPACT_FILT_SQ)
 					&& gyro_mag_sq > GYRO_SQ)
 				{
 					// Impact with rotation → fall confirmed
-					fall_state    = 2;
-					fall_cooldown = 25;
-					state_timer   = 0;
+					fall_state  = 2;
+					state_timer = 0;
+					HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET); // BUZZER ON
 					sprintf(buffer, "*** FALL DETECTED (freefall+impact) ***\r\n");
 					HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 				}
@@ -245,12 +285,15 @@ int main(void)
 				}
 				break;
 
-			/* ---- Phase 2: FALL CONFIRMED — fast-blink cooldown ---- */
+			/* ---- Phase 2: FALL CONFIRMED — buzzer ON, LED fast-blink ---- */
+			/* Button press clears/resets the alarm.                         */
 			case 2:
-				if(--fall_cooldown <= 0)
+				if(btn_pressed)
 				{
-					fall_state   = 0;
-					fall_cooldown = 0;
+					fall_state = 0;
+					HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET); // BUZZER OFF
+					sprintf(buffer, "*** ALARM CLEARED (B2 button) ***\r\n");
+					HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 				}
 				break;
 			}
@@ -308,6 +351,34 @@ static void UART1_Init(void)
 
 }
 
+
+static void UserButton_Init(void)
+{
+	/* PC13 = Blue User Button B2 — external pull-down on the board.
+	 * Pressing the button drives PC13 HIGH (3.3 V).                   */
+	__HAL_RCC_GPIOC_CLK_ENABLE();
+
+	GPIO_InitTypeDef GPIO_InitStruct = {0};
+	GPIO_InitStruct.Pin  = GPIO_PIN_13;
+	GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+	GPIO_InitStruct.Pull = GPIO_NOPULL;   /* board already has external pull-down */
+	HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+}
+
+static void Buzzer_Init(void)
+{
+	/* PB0 = Arduino D3 (TIM3_CH3-capable pin) used as simple GPIO_Output */
+	__HAL_RCC_GPIOB_CLK_ENABLE();
+
+	GPIO_InitTypeDef GPIO_InitStruct = {0};
+	GPIO_InitStruct.Pin   = GPIO_PIN_0;
+	GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+	GPIO_InitStruct.Pull  = GPIO_NOPULL;
+	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+	HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET); // ensure OFF at power-on
+}
 
 // Do not modify these lines of code. They are written to supress UART related warnings
 int _read(int file, char *ptr, int len) { return 0; }
